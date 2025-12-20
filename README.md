@@ -1,4 +1,4 @@
-# fixAIt
+# fiXAIt
 
 To ensure the application runs smoothly, it is recommended to use a computer with a processor that has at least four physical cores.
 
