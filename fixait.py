@@ -189,6 +189,22 @@ class CalcFeatureWeight:
 
         # Safe fallback
         return y_pred.ravel()
+    def _selection_split(self, split: SplitData) -> Tuple[np.ndarray, np.ndarray]:
+        """Split to use for *selection/tuning* computations.
+
+        Prefer OPT (validation) if available; otherwise fall back to TEST.
+        This keeps the final test set untouched by repeated selection loops.
+        """
+        try:
+            X_opt = getattr(split, "X_opt", None)
+            y_opt = getattr(split, "y_opt", None)
+            if X_opt is not None and y_opt is not None and len(X_opt) > 0:
+                return X_opt, y_opt
+        except Exception:
+            pass
+        return split.X_test, split.y_test
+
+
 
 
     def _ensure_split(self) -> SplitData:
@@ -290,13 +306,14 @@ class CalcFeatureWeight:
             raise ValueError(f"Unknown feature name: {e.args[0]}") from e
 
         X_train = split.X_train[:, idxs]
-        X_test = split.X_test[:, idxs]
+        X_sel, y_sel = self._selection_split(split)
+        X_sel = X_sel[:, idxs]
 
         model = self._clone_model()
         model.fit(X_train, split.y_train)
-        y_pred = model.predict(X_test)
+        y_pred = model.predict(X_sel)
         y_pred = self._pred_to_1d_label(y_pred)
-        acc = float(accuracy_score(split.y_test, y_pred))
+        acc = float(accuracy_score(y_sel, y_pred))
 
 
         # Store in cache (do not overwrite if another worker already stored it).
@@ -477,13 +494,14 @@ class CalcFeatureWeight:
         # Train/test matrices for combination features only
         comb_global_idxs = [self._feat_idx_map[f] for f in comb_feats]
         X_train = split.X_train[:, comb_global_idxs]
-        X_test = split.X_test[:, comb_global_idxs]
+        X_sel, y_sel = self._selection_split(split)
+        X_sel = X_sel[:, comb_global_idxs]
 
         model = self._clone_model()
         model.fit(X_train, split.y_train)
-        y_pred = model.predict(X_test)
+        y_pred = model.predict(X_sel)
         y_pred = self._pred_to_1d_label(y_pred)
-        acc = float(accuracy_score(split.y_test, y_pred))
+        acc = float(accuracy_score(y_sel, y_pred))
 
         # Ridge input matrix:
         # Populate the accuracy cache for this subset so downstream stages (e.g.,
@@ -493,10 +511,10 @@ class CalcFeatureWeight:
             self._acc_cache.setdefault(key, acc)
 
         # Ridge input matrix: all selected feats (comb feats filled, others 0) on test rows
-        X_ridge = np.zeros((split.X_test.shape[0], len(selected_feats)), dtype=float)
+        X_ridge = np.zeros((X_sel.shape[0], len(selected_feats)), dtype=float)
         # fill comb columns from corresponding columns in X_test (comb order)
         for j, sel_pos in enumerate(comb_idxs_in_sel):
-            X_ridge[:, sel_pos] = X_test[:, j]
+            X_ridge[:, sel_pos] = X_sel[:, j]
 
         weights = self.regression_ridge_weights(
             X=X_ridge,
