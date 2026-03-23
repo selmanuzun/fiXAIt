@@ -18,6 +18,18 @@ from joblib import Parallel, delayed
 
 
 # -----------------------------
+# Helpers
+# -----------------------------
+def _is_nonempty_arraylike(x) -> bool:
+    if x is None:
+        return False
+    try:
+        return len(x) > 0
+    except Exception:
+        return False
+
+
+# -----------------------------
 # 1) Faithfulness evaluator
 # -----------------------------
 def evaluate_faithfulness(
@@ -50,17 +62,25 @@ def evaluate_faithfulness(
     prefer: str = "threads",
 ):
     """
-Compute feature faithfulness using either:
-  - drop in a classic performance metric (accuracy/f1/log_loss), or
-  - drop in the predicted class probability.
+    Compute feature faithfulness using either:
+      - drop in a classic performance metric (accuracy/f1/log_loss), or
+      - drop in the predicted class probability.
 
-Returns
--------
-faithfulness : float
-drop_impacts : dict[str, float]
-(optional) pd_var : dict[str, float]
-    Only returned when compute_pd_var=True.
-"""
+    Returns
+    -------
+    faithfulness : float
+    drop_impacts : dict[str, float]
+    (optional) pd_var : dict[str, float]
+        Only returned when compute_pd_var=True.
+    """
+
+    # Empty eval guard
+    if X_test is None or y_test is None or len(X_test) == 0 or len(y_test) == 0:
+        if verbose:
+            print("[WARN] Empty X_test/y_test detected in evaluate_faithfulness. Returning zeros.")
+        if compute_pd_var:
+            return 0.0, {}, {}
+        return 0.0, {}
 
     # ------- 1) Importance scores + filtering ---------------------------- #
     imp = pd.Series(importance_scores, dtype=float)
@@ -76,6 +96,17 @@ drop_impacts : dict[str, float]
         else imp.loc[active].index.tolist() if active.any()
         else imp.index.tolist()
     )
+
+    # Keep only features موجود in X_test
+    feats = [f for f in feats if f in X_test.columns]
+
+    if len(feats) == 0:
+        if verbose:
+            print("[WARN] No valid features remained for faithfulness evaluation. Returning zeros.")
+        if compute_pd_var:
+            return 0.0, {}, {}
+        return 0.0, {}
+
     if verbose:
         print(f"Selected {len(feats)} features:", ", ".join(feats))
 
@@ -89,24 +120,38 @@ drop_impacts : dict[str, float]
         elif metric == "log_loss":
             if not hasattr(model, "predict_proba"):
                 raise ValueError("metric='log_loss' requires model.predict_proba.")
-            base_score = -log_loss(y_test, model.predict_proba(X_test))  # higher = better
+            proba_base = model.predict_proba(X_test)
+            if len(proba_base) == 0:
+                if compute_pd_var:
+                    return 0.0, {}, {}
+                return 0.0, {}
+            base_score = -log_loss(y_test, proba_base)  # higher = better
             scorer = None
         else:
             raise ValueError(f"Unsupported metric: {metric}")
 
         if metric != "log_loss":
             y_pred_base = model.predict(X_test)
+            if len(y_pred_base) == 0:
+                if compute_pd_var:
+                    return 0.0, {}, {}
+                return 0.0, {}
             base_score = scorer(y_test, y_pred_base)
 
     elif drop_mode == "prob":
         if not hasattr(model, "predict_proba"):
             raise ValueError("drop_mode='prob' requires model.predict_proba.")
+        proba = model.predict_proba(X_test)
+        if len(proba) == 0:
+            if compute_pd_var:
+                return 0.0, {}, {}
+            return 0.0, {}
+
         if class_id is None:
             class_id_vec = y_test.to_numpy()
-            proba = model.predict_proba(X_test)
             base_scores = proba[np.arange(len(X_test)), class_id_vec]
         else:
-            base_scores = model.predict_proba(X_test)[:, class_id]
+            base_scores = proba[:, class_id]
     else:
         raise ValueError("drop_mode must be 'metric' or 'prob'.")
 
@@ -116,7 +161,6 @@ drop_impacts : dict[str, float]
     # ------- 3) Impact via permutation ---------------------------------- #
     rng_master = check_random_state(random_state)
 
-    # For conditional_permutation: precompute bin indices once per feature
     groups_map: Dict[str, List[np.ndarray]] = {}
     if conditional_permutation:
         for f in feats:
@@ -128,34 +172,52 @@ drop_impacts : dict[str, float]
                     groups.append(idx)
             groups_map[f] = groups
 
-    # Pre-generate per-run seeds for deterministic parallel execution
     seeds_map: Dict[str, np.ndarray] = {
         f: rng_master.randint(0, np.iinfo(np.int32).max, size=runs_per_feature)
         for f in feats
     }
 
     def _impact_one_run(f: str, seed: int) -> float:
+        if len(X_test) == 0:
+            return 0.0
+
         rng = np.random.RandomState(int(seed))
         Xp = X_test.copy()
         col = Xp[f].to_numpy().copy()
 
+        if len(col) == 0:
+            return 0.0
+
         if conditional_permutation:
             for idx in groups_map.get(f, []):
-                rng.shuffle(col[idx])
+                if len(idx) > 1:
+                    rng.shuffle(col[idx])
         else:
-            rng.shuffle(col)
+            if len(col) > 1:
+                rng.shuffle(col)
 
         Xp[f] = col
 
         if drop_mode == "metric":
             if metric == "log_loss":
-                score = -log_loss(y_test, model.predict_proba(Xp))
+                proba_p = model.predict_proba(Xp)
+                if len(proba_p) == 0:
+                    return 0.0
+                score = -log_loss(y_test, proba_p)
             else:
-                score = scorer(y_test, model.predict(Xp))
-            return float(base_score - score)
+                yp = model.predict(Xp)
+                if len(yp) == 0:
+                    return 0.0
+                score = scorer(y_test, yp)
+
+            val = float(base_score - score)
+            return val if np.isfinite(val) else 0.0
 
         # "prob"
         proba = model.predict_proba(Xp)
+        if len(proba) == 0:
+            return 0.0
+
         if class_id is None:
             p = proba[np.arange(len(Xp)), class_id_vec]
         else:
@@ -166,11 +228,26 @@ drop_impacts : dict[str, float]
             diff = np.abs(diff)
         else:
             diff = np.maximum(diff, 0)
-        return float(np.mean(diff))
+
+        diff = np.asarray(diff, dtype=float)
+        diff = diff[np.isfinite(diff)]
+
+        if len(diff) == 0:
+            return 0.0
+
+        val = float(np.mean(diff))
+        return val if np.isfinite(val) else 0.0
 
     def _impact_for_feature(f: str) -> Tuple[str, float]:
         impacts = [_impact_one_run(f, s) for s in seeds_map[f]]
-        return f, float(np.mean(impacts))
+        impacts = np.asarray(impacts, dtype=float)
+        impacts = impacts[np.isfinite(impacts)]
+
+        if len(impacts) == 0:
+            return f, 0.0
+
+        val = float(np.mean(impacts))
+        return f, (val if np.isfinite(val) else 0.0)
 
     if (n_jobs is None) or (int(n_jobs) == 1) or (len(feats) <= 1):
         drop_impacts = dict(_impact_for_feature(f) for f in feats)
@@ -187,22 +264,24 @@ drop_impacts : dict[str, float]
     # ------- 4) (Optional) PD variance ---------------------------------- #
     pd_var: Dict[str, float] = {}
     if compute_pd_var:
-        # Note: PD variance is NOT included in faithfulness. It is only diagnostic.
         target_col = None
-        # Caution: predict_proba(...).mean(axis=1) can become uninformative in multiclass.
-        # Here we track class_id if provided; otherwise we track the true-class column.
         if hasattr(model, "predict_proba"):
             if (drop_mode == "prob") and (class_id is not None):
                 target_col = class_id
             else:
-                # true-class column (assumes label == column index) – consistent with the previous setup
                 target_col = None
 
         low_p, high_p = pdp_percentiles
 
         def _pd_var_for_feature(f: str) -> Tuple[str, float]:
+            if len(X_test) == 0:
+                return f, 0.0
+
             low, high = X_train[f].quantile(low_p), X_train[f].quantile(high_p)
             grid = np.linspace(low, high, grid_resolution)
+
+            if len(grid) == 0:
+                return f, 0.0
 
             pd_mat = np.zeros((len(X_test), len(grid)))
             for i, v in enumerate(grid):
@@ -210,6 +289,8 @@ drop_impacts : dict[str, float]
                 Xt[f] = v
                 if hasattr(model, "predict_proba"):
                     proba = model.predict_proba(Xt)
+                    if len(proba) == 0:
+                        return f, 0.0
                     if target_col is not None:
                         pr = proba[:, target_col]
                     else:
@@ -217,9 +298,20 @@ drop_impacts : dict[str, float]
                         pr = proba[np.arange(len(Xt)), cls]
                 else:
                     pr = model.predict(Xt)
+                    if len(pr) == 0:
+                        return f, 0.0
+
                 pd_mat[:, i] = pr
 
-            return f, float(np.mean(np.var(pd_mat, axis=1)))
+            var_rows = np.var(pd_mat, axis=1)
+            var_rows = np.asarray(var_rows, dtype=float)
+            var_rows = var_rows[np.isfinite(var_rows)]
+
+            if len(var_rows) == 0:
+                return f, 0.0
+
+            val = float(np.mean(var_rows))
+            return f, (val if np.isfinite(val) else 0.0)
 
         if (n_jobs is None) or (int(n_jobs) == 1) or (len(feats) <= 1):
             pd_var = dict(_pd_var_for_feature(f) for f in feats)
@@ -233,16 +325,22 @@ drop_impacts : dict[str, float]
             for f in feats:
                 print(f"PD-var {f}: {pd_var[f]:.4f}")
 
-        # ------- 5) Spearman correlation ------------------------------------ #
-    imp_vals = [imp.abs()[f] for f in feats]
-    impact_vals = [drop_impacts[f] for f in feats]
+    # ------- 5) Spearman correlation ------------------------------------ #
+    imp_vals = [imp.abs()[f] for f in feats if f in drop_impacts]
+    impact_vals = [drop_impacts[f] for f in feats if f in drop_impacts]
 
-    if len(set(imp_vals)) <= 1 or len(set(impact_vals)) <= 1:
+    if len(imp_vals) == 0 or len(impact_vals) == 0:
+        faithfulness = 0.0
+        if verbose:
+            print("No valid values → faithfulness = 0")
+    elif len(set(imp_vals)) <= 1 or len(set(impact_vals)) <= 1:
         faithfulness = 0.0
         if verbose:
             print("No variance → faithfulness = 0")
     else:
         faithfulness, _ = spearmanr(imp_vals, impact_vals)
+        if not np.isfinite(faithfulness):
+            faithfulness = 0.0
         if verbose:
             print(f"Faithfulness (Spearman): {faithfulness:.4f}")
 
@@ -403,10 +501,14 @@ def optimize_importances_with_faithfulness(
     """
     Optimize importance_scores to increase Spearman faithfulness based on drop_impacts computed by evaluate_faithfulness (rank-based).
     """
-    if X_opt is None:  X_opt = X_test
-    if y_opt is None:  y_opt = y_test
-    if X_eval is None: X_eval = X_test
-    if y_eval is None: y_eval = y_test
+    if X_opt is None:
+        X_opt = X_test
+    if y_opt is None:
+        y_opt = y_test
+    if X_eval is None:
+        X_eval = X_test
+    if y_eval is None:
+        y_eval = y_test
 
     if verbose and (X_opt is X_eval) and (y_opt is y_eval):
         print("[WARN] X_opt and X_eval are the same: optimizing and reporting on the same set can inflate faithfulness. "
@@ -442,6 +544,11 @@ def optimize_importances_with_faithfulness(
     features = list(drop_impacts_init.keys())
     if verbose:
         print(f"Optimization will use {len(features)} features (after epsilon/top_k logic).")
+
+    if len(features) == 0:
+        if verbose:
+            print("[WARN] No features available for optimization. Returning original importance_scores.")
+        return dict(importance_scores), faith_init, faith_init, {}, {}
 
     # 2) Rank-grad optimize
     optimized_partial = optimize_weights_with_rank_grad(
@@ -501,7 +608,7 @@ def tune_existence_impact(
     y_eval: pd.Series,
     fit_model: bool = False,
     model_fit_params: Optional[dict] = None,
-    p_exist: Dict[str, float],          # senin p (signed olabilir)
+    p_exist: Dict[str, float],
     X_opt: Optional[pd.DataFrame] = None,
     y_opt: Optional[pd.Series] = None,
     metric: str = "accuracy",
@@ -526,7 +633,6 @@ def tune_existence_impact(
     -------
     p_opt_signed, faith_init, faith_final, drop_init, drop_final
     """
-    # Optional: fit the model inside this function (clone first to avoid mutating the original object)
     if fit_model:
         mfit = deepcopy(model)
         params = model_fit_params or {}
@@ -545,7 +651,7 @@ def tune_existence_impact(
     opt_mag, faith_init, faith_final, drop_init, drop_final = optimize_importances_with_faithfulness(
         model=model,
         X_train=X_train, y_train=y_train,
-        X_test=X_eval,   y_test=y_eval,
+        X_test=X_eval, y_test=y_eval,
         importance_scores=p_mag,
         positive_only=True,
         metric=metric,
@@ -576,13 +682,12 @@ def tune_existence_impact_from_path(
     *,
     path: str,
     label_col: str,
-    base_model,                 # e.g., pick_mdl (unfitted estimator)
-    p_exist: Dict[str, float],  # senin p (existence impact)
+    base_model,
+    p_exist: Dict[str, float],
     test_size: float = 0.20,
-    val_size_in_trainfull: float = 0.25,   # validation fraction inside train_full
+    val_size_in_trainfull: float = 0.25,
     random_state: int = 42,
     stratify: bool = True,
-    # tune parametreleri
     metric: str = "accuracy",
     drop_mode: str = "metric",
     runs_per_feature: int = 100,
@@ -603,7 +708,6 @@ def tune_existence_impact_from_path(
     -------
     p_opt, report, splits, fitted_model
     """
-    # 1) Load data
     data = pd.read_csv(path)
     if label_col not in data.columns:
         raise ValueError(f"label_col='{label_col}' not found in columns: {list(data.columns)}")
@@ -611,7 +715,6 @@ def tune_existence_impact_from_path(
     y = data[label_col]
     X = data.drop(columns=[label_col])
 
-    # 2) Split
     strat = y if stratify else None
     X_train_full, X_test, y_train_full, y_test = train_test_split(
         X, y, test_size=test_size, random_state=random_state, stratify=strat
@@ -625,10 +728,8 @@ def tune_existence_impact_from_path(
         stratify=strat2
     )
 
-    # 3) Fit the model on TRAIN only
     bb_model = deepcopy(base_model)
     bb_model.fit(X_train, y_train)
-
 
     p_opt, f0, f1, drop0, drop1 = tune_existence_impact(
         model=bb_model,
@@ -663,8 +764,6 @@ def tune_existence_impact_from_path(
     }
 
     return p_opt, report, splits, bb_model
-
-
 
 
 __all__ = [
@@ -704,10 +803,8 @@ def tune_existence_impact_from_splitdata(
     split,
     p_exist: Dict[str, float],
     feature_subset: Optional[List[str]] = None,
-    # Opt set: you can override externally; otherwise split.X_opt/y_opt is used
     X_opt=None,
     y_opt=None,
-    # --- tune_existence_impact parameters (explicitly exposed) ---
     fit_model: bool = False,
     model_fit_params: Optional[dict] = None,
     metric: str = "accuracy",
@@ -722,37 +819,15 @@ def tune_existence_impact_from_splitdata(
     verbose: bool = True,
     n_jobs: int = 1,
     prefer: str = "threads",
-    # Accept extra future parameters as well
     **kwargs,
 ):
     """
     Call the tuner from a prepared split object (e.g., CalcFeatureWeight.get_splits()).
-
-    Parametreler
-    -----------
-    split : any object with the required attributes
-        Expected fields:
-          - feature_names
-          - X_train, y_train
-          - X_test/y_test veya X_eval/y_eval
-          - (opsiyonel) X_opt/y_opt
-
-    feature_subset : list[str] | None
-        Must match the columns used to fit the model (e.g., only the selected 7 features).
-        If the model was fitted on the full feature set, leave this as None.
-
-    runs_per_feature : int
-        How many permutation trials to run per feature when computing faithfulness impacts.
-
-    Note
-    ----
-    Earlier versions passed runs_per_feature implicitly via **kwargs; now it is explicitly in the signature and forwarded to tune_existence_impact.
     """
     feature_names = getattr(split, "feature_names")
     X_train = _as_dataframe(getattr(split, "X_train"), feature_names)
     y_train = _as_series(getattr(split, "y_train"))
 
-    # Eval/Test set (priority: X_eval/y_eval -> X_test/y_test)
     if hasattr(split, "X_eval"):
         X_eval = _as_dataframe(getattr(split, "X_eval"), feature_names)
         y_eval = _as_series(getattr(split, "y_eval"))
@@ -760,17 +835,27 @@ def tune_existence_impact_from_splitdata(
         X_eval = _as_dataframe(getattr(split, "X_test"), feature_names)
         y_eval = _as_series(getattr(split, "y_test"))
 
-    # Opt/Validation set (priority: user override -> split.X_opt/y_opt)
+    raw_X_opt = getattr(split, "X_opt", None) if hasattr(split, "X_opt") else None
+    raw_y_opt = getattr(split, "y_opt", None) if hasattr(split, "y_opt") else None
+
     if X_opt is not None:
         X_opt_df = _as_dataframe(X_opt, feature_names)
-    elif hasattr(split, "X_opt"):
-        X_opt_df = _as_dataframe(getattr(split, "X_opt"), feature_names)
+        if not _is_nonempty_arraylike(X_opt_df):
+            X_opt_df = None
+    elif _is_nonempty_arraylike(raw_X_opt):
+        X_opt_df = _as_dataframe(raw_X_opt, feature_names)
     else:
         X_opt_df = None
 
-    y_opt_sr = _as_series(y_opt) if y_opt is not None else (_as_series(getattr(split, "y_opt")) if hasattr(split, "y_opt") else None)
+    if y_opt is not None:
+        y_opt_sr = _as_series(y_opt)
+        if not _is_nonempty_arraylike(y_opt_sr):
+            y_opt_sr = None
+    elif _is_nonempty_arraylike(raw_y_opt):
+        y_opt_sr = _as_series(raw_y_opt)
+    else:
+        y_opt_sr = None
 
-    # Optional: subset X_* to specific columns (must match how the model was fitted)
     if feature_subset is not None:
         feature_subset = [c for c in feature_subset if c in X_train.columns]
         X_train = X_train[feature_subset]
@@ -813,7 +898,6 @@ def fiXAItImportanceTuner(
     feature_subset: Optional[List[str]] = None,
     X_opt=None,
     y_opt=None,
-    # --- tune_existence_impact parameters (explicit) ---
     fit_model: bool = False,
     model_fit_params: Optional[dict] = None,
     metric: str = "accuracy",
@@ -832,23 +916,6 @@ def fiXAItImportanceTuner(
 ):
     """
     Wire a CalcFeatureWeight instance (cfw) directly into the tuner.
-
-    What is cfw?
-    -----------
-    An instance of your CalcFeatureWeight class (including the optimized version).
-    Beklenenler:
-      - cfw.get_splits()  -> SplitData (X_train/X_opt/X_test + feature_names)
-      - cfw.new_weight_format -> p (existence impact) (used if p_exist is not provided)
-
-    Why is feature_subset needed?
-    ---------------------------
-    If you fitted the base model using only a subset of features, the tuner must predict using the same column set. Otherwise:
-      - sklearn can raise a "feature mismatch" error (DataFrame columns differ)
-      - or you can get incorrect results due to column order/misalignment.
-
-    Why did runs_per_feature look missing?
-    -------------------------------------
-    In earlier versions the wrapper forwarded it via **kwargs; here it is explicitly in the signature.
     """
     if p_exist is None:
         p_exist = getattr(cfw, "new_weight_format", None)
@@ -879,4 +946,3 @@ def fiXAItImportanceTuner(
         prefer=prefer,
         **kwargs,
     )
-
