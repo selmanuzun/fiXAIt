@@ -74,7 +74,7 @@ class CalcFeatureWeight:
         step: int = 1,
         alphas: Optional[List[float]] = None,
         test_size: float = 0.20,
-        opt_size: float = 0.20,
+        opt_size: Optional[float] = 0.0,
         random_state: int = 42,
         stratify: bool = False,
         n_jobs: int = -1,
@@ -111,7 +111,7 @@ class CalcFeatureWeight:
         self.alphas = alphas if alphas is not None else [0.001, 0.01, 0.1, 1.0, 10.0, 100.0]
         self.test_size = float(test_size)
         self.random_state = int(random_state)
-        self.opt_size = float(opt_size)
+        self.opt_size = 0.0 if opt_size is None else float(opt_size)
         self.do_stratify = bool(stratify)
 
         self.n_jobs = int(n_jobs)
@@ -230,7 +230,10 @@ class CalcFeatureWeight:
         scaler = MinMaxScaler()
         scaler.fit(X_train)
         X_train_s = scaler.transform(X_train)
-        X_opt_s = scaler.transform(X_opt)
+        if len(opt_idx) > 0:
+            X_opt_s = scaler.transform(X_opt)
+        else:
+            X_opt_s = np.empty((0, X_train.shape[1]), dtype=float)
         X_test_s = scaler.transform(X_test)
 
         self.split_ = SplitData(
@@ -251,8 +254,17 @@ class CalcFeatureWeight:
         return self.split_
 
     def _split_indices(self, n: int, y: np.ndarray, stratify: Optional[np.ndarray]):
-        """Index-based 3-way split: train/opt/test."""
+        """Index-based split.
+
+        - If opt_size is None or <= 0: perform a 2-way split (train/test) and return an
+          empty opt split.
+        - If opt_size > 0: perform the original 3-way split (train/opt/test).
+        """
         idx = np.arange(n)
+
+        if not (0.0 < self.test_size < 1.0):
+            raise ValueError("test_size must be between 0 and 1.")
+
         # 1) train_full vs test
         train_full_idx, test_idx = train_test_split(
             idx,
@@ -260,9 +272,21 @@ class CalcFeatureWeight:
             random_state=self.random_state,
             stratify=stratify,
         )
-        # 2) train vs opt (so that opt_size is a fraction of the full dataset)
+
+        # 2) If validation/opt is disabled, return train/test only.
+        if self.opt_size is None or self.opt_size <= 0.0:
+            return (
+                np.asarray(train_full_idx),
+                np.empty(0, dtype=int),
+                np.asarray(test_idx),
+            )
+
         if not (0.0 < self.opt_size < 1.0):
-            raise ValueError("opt_size must be between 0 and 1.")
+            raise ValueError("opt_size must be between 0 and 1 when validation is enabled.")
+        if self.test_size + self.opt_size >= 1.0:
+            raise ValueError("test_size + opt_size must be less than 1.")
+
+        # 3) train vs opt (so that opt_size is a fraction of the full dataset)
         opt_rel = self.opt_size / max(1e-12, (1.0 - self.test_size))
         opt_rel = float(np.clip(opt_rel, 1e-6, 0.999999))
         strat2 = None
@@ -445,9 +469,22 @@ class CalcFeatureWeight:
         """
         Select alpha with RidgeCV and return coefficients.
         feature_names: feature names excluding the target
+
+        Patch:
+        - make cv dynamic so small sample groups do not fail
+        - return zero weights if there are not enough samples to fit safely
         """
+        X = np.asarray(X, dtype=float)
+        y = np.asarray(y, dtype=float)
+        n_samples = len(X)
+
+        if n_samples < 2:
+            return dict(zip(feature_names, np.zeros(len(feature_names), dtype=float)))
+
+        cv_splits = min(5, n_samples)
+
         # RidgeCV is MSE-based; it also works with class labels (as a regression proxy)
-        ridge = RidgeCV(alphas=alphas, cv=5)
+        ridge = RidgeCV(alphas=alphas, cv=cv_splits)
         ridge.fit(X, y)
         coef = np.asarray(ridge.coef_)
         if coef.ndim == 2:
@@ -591,15 +628,28 @@ class CalcFeatureWeight:
     @staticmethod
     def regression_compute_ridgecv(zero_count: int, group: List[List[float]], features: List[str], acc: float, alphas: List[float]) -> Tuple[int, Dict[str, float]]:
         """
-        Original regression_compute_Ridge: use RidgeCV instead of GridSearchCV (cv=3 for speed).
+        Original regression_compute_Ridge: use RidgeCV instead of GridSearchCV.
+
+        Patch:
+        - make cv dynamic so small groups do not fail when n_samples < 3
+        - keep the existing anchor-row logic
         """
         X = [item[:-1] for item in group]
         X.append([1.0] * len(features))
         y = [item[-1] for item in group]
         y.append(float(acc))
 
-        ridge = RidgeCV(alphas=alphas, cv=3)
-        ridge.fit(np.asarray(X, dtype=float), np.asarray(y, dtype=float))
+        X = np.asarray(X, dtype=float)
+        y = np.asarray(y, dtype=float)
+        n_samples = len(X)
+
+        if n_samples < 2:
+            return zero_count, dict(zip(features, np.zeros(len(features), dtype=float)))
+
+        cv_splits = min(3, n_samples)
+
+        ridge = RidgeCV(alphas=alphas, cv=cv_splits)
+        ridge.fit(X, y)
 
         weights = dict(zip(features, np.round(ridge.coef_, 9)))
         return zero_count, weights
