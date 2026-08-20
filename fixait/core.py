@@ -3,8 +3,8 @@
 calc_feature_weight_optimized.py
 
 Refactor + performance optimizations:
-- CSV read / train_test_split / scaling are executed once (cached) → no repeated split+scaler work
-- Accuracy for feature subsets is cached → prevents repeated fit/predict on the same subset
+- CSV read / train_test_split / scaling are executed once (cached) â†’ no repeated split+scaler work
+- Accuracy for feature subsets is cached â†’ prevents repeated fit/predict on the same subset
 - Plots are disabled by default (plot=False)
 - Single-layer parallelism: outer joblib.Parallel only; RidgeCV is used instead of GridSearchCV to avoid nested parallelism
 - The model is cloned for each job (deepcopy/clone). Optionally force estimator n_jobs=1 to prevent CPU oversubscription
@@ -20,7 +20,7 @@ from __future__ import annotations
 from copy import deepcopy
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Dict, List, Tuple, Optional, Any, Iterable
+from typing import Dict, List, Tuple, Optional, Any, Iterable, Sequence
 
 import threading
 
@@ -29,11 +29,13 @@ import pandas as pd
 
 from joblib import Parallel, delayed
 
-from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.metrics import accuracy_score
 from sklearn.linear_model import RidgeCV
 from sklearn.base import clone as sk_clone
+
+from .combinations import generate_cyclic_ecfc_combinations
+from .splitting import make_split_indices
 
 
 @dataclass
@@ -69,23 +71,31 @@ class CalcFeatureWeight:
         data_path: Optional[str] = None,
         usecols: Optional[List[str]] = None,
         df: Optional[pd.DataFrame] = None,
+        target_column: str = "class",
         model: Any,
         group_size: int = 7,
         step: int = 1,
         alphas: Optional[List[float]] = None,
         test_size: float = 0.20,
-        opt_size: Optional[float] = 0.0,
+        opt_size: Optional[float] = 0.20,
         random_state: int = 42,
         stratify: bool = False,
+        feature_selection_scope: str = "train",
+        top_k_groups: Optional[int] = 12,
+        compatibility_mode: bool = False,
         n_jobs: int = -1,
         prefer: str = "threads",
         model_n_jobs: Optional[int] = 1,
+        split_indices: Optional[Tuple[Sequence[int], Sequence[int], Sequence[int]]] = None,
         auto_run: bool = True,
         plot: bool = False,
         verbose: bool = True,
     ):
         if (df is None) == (data_path is None):
             raise ValueError("Provide exactly ONE of df or data_path.")
+        if not isinstance(target_column, str) or not target_column.strip():
+            raise ValueError("target_column must be a non-empty string.")
+        self.target_column = target_column
 
         self.verbose = verbose
         self.plot = plot
@@ -94,14 +104,26 @@ class CalcFeatureWeight:
         self.step = int(step)
 
         if df is not None:
-            self.data_f = df.copy()
+            loaded_data = df.copy()
         else:
             _usecols = None
             if usecols is not None:
                 _usecols = list(usecols)
-                if "class" not in _usecols:
-                    _usecols.append("class")
-            self.data_f = pd.read_csv(data_path, usecols=_usecols)
+                if target_column not in _usecols:
+                    _usecols.append(target_column)
+            loaded_data = pd.read_csv(data_path, usecols=_usecols)
+
+        if target_column not in loaded_data.columns:
+            raise ValueError(
+                f"Target column {target_column!r} was not found. "
+                f"Available columns: {list(loaded_data.columns)}"
+            )
+        if target_column != "class" and "class" in loaded_data.columns:
+            raise ValueError(
+                "The feature name 'class' is reserved internally when target_column "
+                f"is {target_column!r}. Rename that feature before fitting."
+            )
+        self.data_f = loaded_data.rename(columns={target_column: "class"})
         self.num_of_data = len(self.data_f)
 
         # Model template (should be unfitted)
@@ -113,6 +135,17 @@ class CalcFeatureWeight:
         self.random_state = int(random_state)
         self.opt_size = 0.0 if opt_size is None else float(opt_size)
         self.do_stratify = bool(stratify)
+        if split_indices is not None and len(split_indices) != 3:
+            raise ValueError("split_indices must contain train, validation, and test arrays.")
+        self._provided_split_indices = None if split_indices is None else tuple(
+            np.asarray(partition, dtype=int).copy() for partition in split_indices
+        )
+        if feature_selection_scope not in {"train", "full"}:
+            raise ValueError("feature_selection_scope must be either 'train' or 'full'.")
+        self.feature_selection_scope = feature_selection_scope
+        self.top_k_groups = None if top_k_groups is None else int(top_k_groups)
+        self.compatibility_mode = bool(compatibility_mode)
+        self.ridge_scoring = None if self.compatibility_mode else "neg_mean_squared_error"
 
         self.n_jobs = int(n_jobs)
         self.prefer = str(prefer)
@@ -139,6 +172,7 @@ class CalcFeatureWeight:
 
         # Split + scaling cache (this is where the big speed-up comes from)
         self.split_: Optional[SplitData] = None
+        self.scaler_: Optional[MinMaxScaler] = None
 
         # Accuracy cache: prevents repeated fit/predict for the same feature subset.
         # Key: tuple(sorted(feature_names_without_class))
@@ -147,6 +181,18 @@ class CalcFeatureWeight:
 
         # Fast feature-name to column-index mapping for repeated subset selection.
         self._feat_idx_map: Optional[Dict[str, int]] = None
+
+        feature_count = len([c for c in self.data_f.columns if c != "class"])
+        if "class" not in self.data_f.columns:
+            raise ValueError('Label column "class" was not found.')
+        if self.group_size < 2:
+            raise ValueError("group_size must be at least 2.")
+        if self.group_size > feature_count:
+            raise ValueError(
+                f"group_size ({self.group_size}) cannot exceed the number of features ({feature_count})."
+            )
+        if self.step < 1:
+            raise ValueError("step must be at least 1.")
 
         if auto_run:
             self.run(plot=plot)
@@ -229,6 +275,7 @@ class CalcFeatureWeight:
         # Single scaler: fit on train, apply to train/opt/test
         scaler = MinMaxScaler()
         scaler.fit(X_train)
+        self.scaler_ = scaler
         X_train_s = scaler.transform(X_train)
         if len(opt_idx) > 0:
             X_opt_s = scaler.transform(X_opt)
@@ -260,45 +307,17 @@ class CalcFeatureWeight:
           empty opt split.
         - If opt_size > 0: perform the original 3-way split (train/opt/test).
         """
-        idx = np.arange(n)
-
-        if not (0.0 < self.test_size < 1.0):
-            raise ValueError("test_size must be between 0 and 1.")
-
-        # 1) train_full vs test
-        train_full_idx, test_idx = train_test_split(
-            idx,
+        if n != len(y):
+            raise ValueError("n must match the number of labels.")
+        if self._provided_split_indices is not None:
+            return tuple(partition.copy() for partition in self._provided_split_indices)
+        return make_split_indices(
+            y,
             test_size=self.test_size,
+            validation_size=self.opt_size,
             random_state=self.random_state,
-            stratify=stratify,
+            stratify=stratify is not None,
         )
-
-        # 2) If validation/opt is disabled, return train/test only.
-        if self.opt_size is None or self.opt_size <= 0.0:
-            return (
-                np.asarray(train_full_idx),
-                np.empty(0, dtype=int),
-                np.asarray(test_idx),
-            )
-
-        if not (0.0 < self.opt_size < 1.0):
-            raise ValueError("opt_size must be between 0 and 1 when validation is enabled.")
-        if self.test_size + self.opt_size >= 1.0:
-            raise ValueError("test_size + opt_size must be less than 1.")
-
-        # 3) train vs opt (so that opt_size is a fraction of the full dataset)
-        opt_rel = self.opt_size / max(1e-12, (1.0 - self.test_size))
-        opt_rel = float(np.clip(opt_rel, 1e-6, 0.999999))
-        strat2 = None
-        if stratify is not None:
-            strat2 = y[np.asarray(train_full_idx)]
-        train_idx, opt_idx = train_test_split(
-            np.asarray(train_full_idx),
-            test_size=opt_rel,
-            random_state=self.random_state + 1,
-            stratify=strat2,
-        )
-        return np.asarray(train_idx), np.asarray(opt_idx), np.asarray(test_idx)
 
     def _acc_for_feature_set(self, feat_names_with_class: List[str]) -> float:
         """Compute test accuracy for a given feature subset (cached).
@@ -353,8 +372,14 @@ class CalcFeatureWeight:
     def prepare_data(self) -> None:
         self._log("prepare_data: normalize + class means ...")
 
-        class_element = self.data_f["class"].copy()
-        feature_elements = self.data_f.drop(columns=["class"]).copy()
+        split = self._ensure_split()
+        if self.feature_selection_scope == "train":
+            selection_data = self.data_f.iloc[split.train_idx].copy()
+        else:
+            selection_data = self.data_f
+
+        class_element = selection_data["class"].copy()
+        feature_elements = selection_data.drop(columns=["class"]).copy()
 
         # Like the original code: normalize on the full dataset (for feature selection)
         scaler = MinMaxScaler()
@@ -372,8 +397,8 @@ class CalcFeatureWeight:
         self.cols = self.df_norm.columns.tolist()
         self.num_of_feature = len(feature_elements.columns)
 
-        # Also build the split cache (model scoring is used many times)
-        self._ensure_split()
+        # The split cache was built before feature selection so strict mode can
+        # derive CBSFSA statistics from training rows only.
 
     # ----------------------------
     # Original comb_diff_total
@@ -398,9 +423,16 @@ class CalcFeatureWeight:
     # ----------------------------
     # Choose important features by testing candidate groups
     # ----------------------------
-    def important_feature(self, group_features: List[List[str]], top_k_groups: int = 12) -> List[str]:
+    def important_feature(self, group_features: List[List[str]], top_k_groups: Optional[int] = None) -> List[str]:
         self._log("important_feature: picking the candidate group with the best accuracy ...")
-        gs = min(top_k_groups, len(group_features))
+        if not group_features:
+            raise ValueError(
+                "CBSFSA produced no candidate feature groups. Check group_size and step."
+            )
+        limit = self.top_k_groups if top_k_groups is None else top_k_groups
+        gs = len(group_features) if limit is None else min(int(limit), len(group_features))
+        if gs < 1:
+            raise ValueError("top_k_groups must be positive or None.")
         params = group_features[:gs]
 
         # Outer parallelism is here
@@ -445,16 +477,7 @@ class CalcFeatureWeight:
 
     @staticmethod
     def generate_combinations(properties: List[str]) -> List[List[str]]:
-        # Original logic is preserved, but duplicates are reduced
-        n = len(properties)
-        combos_set = set()
-        for i in range(n):
-            rotated = properties[i:] + properties[:i]
-            for j in range(1, n):
-                combo = tuple(sorted(rotated[:j]))
-                if list(combo) != properties:
-                    combos_set.add(combo)
-        return [list(c) for c in sorted(combos_set)]
+        return generate_cyclic_ecfc_combinations(properties)
 
     @staticmethod
     def convert_to_values(properties: List[str], values: np.ndarray, combination: List[str]) -> List[float]:
@@ -465,7 +488,13 @@ class CalcFeatureWeight:
     # Ridge (fast): use RidgeCV instead of GridSearchCV
     # ----------------------------
     @staticmethod
-    def regression_ridge_weights(X: np.ndarray, y: np.ndarray, feature_names: List[str], alphas: List[float]) -> Dict[str, float]:
+    def regression_ridge_weights(
+        X: np.ndarray,
+        y: np.ndarray,
+        feature_names: List[str],
+        alphas: List[float],
+        scoring: Optional[str] = "neg_mean_squared_error",
+    ) -> Dict[str, float]:
         """
         Select alpha with RidgeCV and return coefficients.
         feature_names: feature names excluding the target
@@ -484,7 +513,7 @@ class CalcFeatureWeight:
         cv_splits = min(5, n_samples)
 
         # RidgeCV is MSE-based; it also works with class labels (as a regression proxy)
-        ridge = RidgeCV(alphas=alphas, cv=cv_splits)
+        ridge = RidgeCV(alphas=alphas, cv=cv_splits, scoring=scoring)
         ridge.fit(X, y)
         coef = np.asarray(ridge.coef_)
         if coef.ndim == 2:
@@ -558,6 +587,7 @@ class CalcFeatureWeight:
             y=y_pred.astype(float),
             feature_names=selected_feats,
             alphas=self.alphas,
+            scoring=self.ridge_scoring,
         )
         return weights, acc
 
@@ -580,25 +610,25 @@ class CalcFeatureWeight:
         selected_feats = selected_all_features_with_class[:-1]
 
         df_feature_val = self.df2[selected_feats]
-        values = df_feature_val.iloc[0].values
-
         combinations = self.generate_combinations(selected_feats)
-        values_combinations = [self.convert_to_values(selected_feats, values, combo) for combo in combinations]
-        result_df = pd.DataFrame(values_combinations, columns=selected_feats)
-
-        # non-zero columns => combination features
-        imp_feature_comb = [row[row != 0].index.tolist() for _, row in result_df.iterrows()]
-        imp_feature_comb = [sorted(c) for c in imp_feature_comb if len(c) > 0]
-        # Patch: de-duplicate combinations to avoid repeated work ----------------
-        seen = set()
-        imp_feature_comb_uniq = []
-        for c in imp_feature_comb:
-            t = tuple(c)
-            if t not in seen:
-                seen.add(t)
-                imp_feature_comb_uniq.append(c)
-        imp_feature_comb = imp_feature_comb_uniq
-        # ------------------------------------------------------------------
+        if self.compatibility_mode:
+            values = df_feature_val.iloc[0].values
+            values_combinations = [
+                self.convert_to_values(selected_feats, values, combo)
+                for combo in combinations
+            ]
+            result_df = pd.DataFrame(values_combinations, columns=selected_feats)
+            imp_feature_comb = [
+                sorted(row[row != 0].index.tolist())
+                for _, row in result_df.iterrows()
+                if len(row[row != 0]) > 0
+            ]
+            imp_feature_comb = list(dict.fromkeys(tuple(c) for c in imp_feature_comb))
+            imp_feature_comb = [list(c) for c in imp_feature_comb]
+        else:
+            # Use the ECFC output directly. Inferring membership from non-zero
+            # CBSFSA scores silently drops a legitimately selected zero-score feature.
+            imp_feature_comb = [sorted(combo) for combo in combinations]
 
         # Add "class"
         imp_feature_comb_w_class = [c + ["class"] for c in imp_feature_comb]
@@ -626,7 +656,14 @@ class CalcFeatureWeight:
     # Regression compute per group (RidgeCV)
     # ----------------------------
     @staticmethod
-    def regression_compute_ridgecv(zero_count: int, group: List[List[float]], features: List[str], acc: float, alphas: List[float]) -> Tuple[int, Dict[str, float]]:
+    def regression_compute_ridgecv(
+        zero_count: int,
+        group: List[List[float]],
+        features: List[str],
+        acc: float,
+        alphas: List[float],
+        scoring: Optional[str] = "neg_mean_squared_error",
+    ) -> Tuple[int, Dict[str, float]]:
         """
         Original regression_compute_Ridge: use RidgeCV instead of GridSearchCV.
 
@@ -648,7 +685,7 @@ class CalcFeatureWeight:
 
         cv_splits = min(3, n_samples)
 
-        ridge = RidgeCV(alphas=alphas, cv=cv_splits)
+        ridge = RidgeCV(alphas=alphas, cv=cv_splits, scoring=scoring)
         ridge.fit(X, y)
 
         weights = dict(zip(features, np.round(ridge.coef_, 9)))
@@ -692,7 +729,14 @@ class CalcFeatureWeight:
             groups[0] = data
 
         def process(zero_count: int, group: List[List[float]]):
-            return self.regression_compute_ridgecv(zero_count, group, features, acc, self.alphas)
+            return self.regression_compute_ridgecv(
+                zero_count,
+                group,
+                features,
+                acc,
+                self.alphas,
+                self.ridge_scoring,
+            )
 
         results = Parallel(n_jobs=self.n_jobs, prefer=self.prefer)(
             delayed(process)(zero_count, group) for zero_count, group in groups.items()
@@ -857,7 +901,7 @@ class CalcFeatureWeight:
 
         return self
 
-    def compute_value_impact(self) -> Dict[str, float]:
+    def compute_value_impact(self, *, normalize: bool = False) -> Dict[str, float]:
         """
         Expose the original val_impact_dict computation as a method.
         """
@@ -871,7 +915,13 @@ class CalcFeatureWeight:
             key: round(sum(float(sub_dict.get(key, 0.0)) for sub_dict in main_dict_valimp.values()) / len(main_dict_valimp), 3)
             for key in auto_keys_valimp
         }
-        return val_impact_dict
+        if not normalize:
+            return val_impact_dict
+
+        denominator = sum(abs(value) for value in val_impact_dict.values())
+        if denominator <= 0:
+            return {key: 0.0 for key in val_impact_dict}
+        return {key: float(value / denominator) for key, value in val_impact_dict.items()}
 
     def get_splits(self) -> SplitData:
         """Return the one-time split+scaled arrays (useful for the tuner)."""

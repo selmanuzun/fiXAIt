@@ -1,0 +1,20 @@
+{
+  "description": "Published global implementation compatibility snapshot",
+  "sklearn_version": "1.4.2",
+  "features": ["f0", "f1", "f3", "f5", "f6", "class"],
+  "algorithm_consistency": 0.558,
+  "global_fei": {
+    "f6": 0.0966722706,
+    "f5": 0.08903543120000001,
+    "f0": 0.0446287866,
+    "f1": 0.02835951500000001,
+    "f3": 0.016738024000000004
+  },
+  "global_fvi": {
+    "f0": -2.175,
+    "f1": 2.302,
+    "f3": -0.033,
+    "f5": -2.891,
+    "f6": -0.626
+  }
+}
